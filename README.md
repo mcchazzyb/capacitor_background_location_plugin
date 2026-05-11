@@ -22,6 +22,10 @@ A Capacitor 8 plugin for **continuous background location tracking** with **nati
 
 *Last updated: 11/5/26*
 
+## Why This Exists
+
+This plugin was built because [`@transistorsoft/capacitor-background-geolocation`](https://github.com/transistorsoft/capacitor-background-geolocation) — the main alternative — costs $399 for a license, and the community edition no longer works with Capacitor 8. This is a focused, MIT-licensed alternative that does one thing well: continuous background location POSTing to your own endpoint.
+
 ## Install
 
 ```bash
