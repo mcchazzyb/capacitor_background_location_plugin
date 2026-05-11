@@ -310,6 +310,15 @@ Headers: `Content-Type: application/json`, `apikey`, `Authorization`, `Prefer: r
 | Android package name    | `namespace` in `android/build.gradle` + `package` in Kotlin files               |
 | Additional start params | `StartOptions` in `src/index.ts` + both native `start()` methods                |
 
+## Security
+
+Scanned with Snyk on 11/5/26:
+
+| Scan | Result |
+|------|--------|
+| SAST (Static Code Analysis) | ✅ 0 issues |
+| SCA (Dependency Vulnerabilities) | ✅ 0 issues |
+
 ## License
 
 MIT
