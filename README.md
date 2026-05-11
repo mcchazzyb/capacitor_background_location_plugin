@@ -18,7 +18,9 @@ A Capacitor 8 plugin for **continuous background location tracking** with **nati
 | Platform | Tested |
 |----------|--------|
 | iOS      | ✅ Yes  |
-| Android  | ❌ Not yet (as of 11/5/26) |
+| Android  | ⚠️ Not yet — likely requires verification on Android 14+ (see [Android caveats](#android-caveats)) |
+
+*Last updated: 11/5/26*
 
 ## Install
 
@@ -26,6 +28,24 @@ A Capacitor 8 plugin for **continuous background location tracking** with **nati
 npm install capacitor-background-location
 npx cap sync
 ```
+
+## Critical: Plugin Registration
+
+`registerPlugin` returns a Proxy that exposes a `then` getter. If you wrap it in `Promise.resolve()` or `await` the registration, the JS microtask scheduler treats it as a thenable and **hangs forever**.
+
+```typescript
+// ✅ Correct — synchronous, top-level module scope
+import { registerPlugin } from '@capacitor/core';
+const BackgroundLocation = registerPlugin<BackgroundLocationPlugin>('BackgroundLocation');
+export { BackgroundLocation };
+
+// ❌ WRONG — will hang forever
+const BackgroundLocation = await import('@capacitor/core').then(c =>
+  c.registerPlugin('BackgroundLocation')
+);
+```
+
+Always register at module top-level, synchronously. Never `await` the registration.
 
 ## iOS Setup
 
@@ -44,6 +64,15 @@ Add to your app's `Info.plist`:
 
 No additional registration needed — the plugin uses `CAPBridgedPlugin` and is auto-discovered by Capacitor 8.
 
+### iOS Notes
+
+- `showsBackgroundLocationIndicator = true` is set by the plugin. This is **required** for App Store review when using Always authorization.
+- `pausesLocationUpdatesAutomatically = false` — the plugin disables auto-pause so tracking continues even when stationary (e.g. chairlift, waiting).
+- `distanceFilter = kCLDistanceFilterNone` — every fix is emitted regardless of movement.
+- `activityType = .otherNavigation` — prevents iOS from aggressively pausing updates.
+
+Without these settings, iOS will pause location updates and users will report "tracking stopped".
+
 ## Android Setup
 
 Add these permissions to your app's `AndroidManifest.xml`:
@@ -58,6 +87,13 @@ Add these permissions to your app's `AndroidManifest.xml`:
 ```
 
 The plugin's `AndroidManifest.xml` already declares the foreground service component — it merges automatically during build.
+
+### Android Caveats
+
+> ⚠️ Android is not yet tested in production. The following are known requirements that may need verification:
+
+- **Android 14+**: `FOREGROUND_SERVICE_LOCATION` requires the service type to be declared in the manifest AND the service must call `startForeground()` within 10 seconds of `startForegroundService()` or the system kills it. The plugin does this, but edge cases (slow permission prompts) may need testing.
+- The foreground service type `android:foregroundServiceType="location"` is declared in the plugin manifest.
 
 ## Usage
 
@@ -83,7 +119,7 @@ BackgroundLocation.addListener('fix', (data) => {
 
 // Handle token expiry — refresh and call start() again
 BackgroundLocation.addListener('authExpired', () => {
-  // refresh token, then re-call start()
+  // refresh token, then re-call start() with fresh authorization
 });
 
 // Handle permission denial
@@ -97,6 +133,125 @@ await BackgroundLocation.stop();
 // Check current state
 const status = await BackgroundLocation.getStatus();
 ```
+
+## Auth Expiry & 401 Backoff
+
+When the native POST receives a 401:
+
+1. The `authExpired` event fires to JS
+2. **POSTs are suppressed for 60 seconds** (iOS) to avoid hammering your backend
+3. GPS fixes continue to be collected — they just aren't POSTed
+4. **You must call `start()` again with a fresh `authorization` value** to clear the backoff and resume POSTing
+
+Simply refreshing the token in JS is not enough — the native layer holds the old token. You must re-call `start()` with the new one.
+
+## Auth Session Timing
+
+If your auth client restores sessions from storage asynchronously (common with token-based auth libraries), `getSession()` may hang on cold start before the session is restored.
+
+Either:
+
+1. **Wait for your auth state listener to confirm the session is ready** before calling `start()`, or
+2. **Race the session call with a timeout**:
+
+```typescript
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+const session = await withTimeout(auth.getSession(), 5000, 'getSession');
+```
+
+## Upsert / Duplicate Handling
+
+The plugin sends a `Prefer: resolution=merge-duplicates` header on every POST. This is designed for REST APIs that support upsert semantics (e.g. PostgREST-compatible backends).
+
+If your backend supports this, ensure your target table has a **unique constraint** on `(session_id, participant_type)` — otherwise upserts may fail silently with 409.
+
+If your backend doesn't use this header, it's harmless and will be ignored.
+
+## Best Practices
+
+### Use a Timeout Helper
+
+Silent hangs are extremely hard to debug in mobile. Wrap every awaited step with per-step timeouts:
+
+```typescript
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+// Usage
+const session = await withTimeout(getSession(), 5000, 'auth.getSession');
+await withTimeout(BackgroundLocation.start({ ... }), 10000, 'BackgroundLocation.start');
+```
+
+### Singleton Ownership Pattern
+
+Own the location watcher in a **module-level singleton**, not inside a React/Vue component. React effect cleanups will tear down background tracking on navigation.
+
+```typescript
+// location-service.ts — singleton, outside component tree
+import { BackgroundLocation } from 'capacitor-background-location';
+
+let isTracking = false;
+
+export async function startTracking(opts: StartOptions) {
+  if (isTracking) return;
+  await BackgroundLocation.start(opts);
+  isTracking = true;
+}
+
+export async function stopTracking() {
+  if (!isTracking) return;
+  await BackgroundLocation.stop();
+  await BackgroundLocation.removeAllListeners();
+  isTracking = false;
+}
+```
+
+### Consent Persistence
+
+The plugin does not persist consent state. Store per-session consent in `localStorage` (not cookies — important for GDPR) and re-call `start()` on app resume:
+
+```typescript
+// On consent granted
+localStorage.setItem('location_consent', JSON.stringify({ sessionId, grantedAt: Date.now() }));
+
+// On app resume (e.g. Capacitor App.addListener('appStateChange'))
+const consent = JSON.parse(localStorage.getItem('location_consent') || 'null');
+if (consent && consent.sessionId === currentSessionId) {
+  await startTracking({ ... });
+}
+```
+
+## Distribution & Linking
+
+### Via npm (standard)
+
+```bash
+npm install capacitor-background-location
+npx cap sync
+```
+
+Capacitor 8 auto-discovers the plugin via `CAPBridgedPlugin` (iOS) and `@CapacitorPlugin` annotation (Android).
+
+### Vendored in-repo
+
+If you vendor the plugin source directly into your project (e.g. under `native-plugins/`), auto-discovery won't work. You need:
+
+- **iOS**: Add a `.podspec` or SPM `Package.swift` entry that links the Swift source into your app target
+- **Android**: Add the module to `settings.gradle` and reference it as a project dependency
 
 ## StartOptions
 
@@ -121,14 +276,6 @@ const status = await BackgroundLocation.getStatus();
 | `lastFixAt`       | number \| null | Unix ms timestamp of last GPS fix         |
 | `lastWriteAt`     | number \| null | Unix ms timestamp of last successful POST |
 | `lastError`       | string \| null | Last error message, or null if healthy    |
-
-## How It Works
-
-**iOS** — `CLLocationManager` with `allowsBackgroundLocationUpdates`. Each fix triggers a native `URLSession` POST, independent of the JS bridge.
-
-**Android** — Foreground service with `FusedLocationProviderClient` for GPS and OkHttp for the POST. Survives app backgrounding.
-
-**Auth expiry** — Both platforms detect 401 responses, fire `authExpired` to JS, and back off from POSTing until a fresh token is provided via `start()`.
 
 ## POST Payload
 
@@ -163,14 +310,24 @@ MIT
 
 ## LLM Integration Guide
 
-> This section is for AI coding assistants (Claude, GPT, Lovable, Kimi, Cursor, etc.) implementing this plugin into a Capacitor app.
+> This section is for AI coding assistants (Claude, GPT, Lovable, Kimi, Cursor, etc.) implementing this plugin into a Capacitor 8 app.
+
+### Critical Rules
+
+1. **NEVER `await` the plugin registration.** `registerPlugin()` returns a Proxy with a `then` getter — awaiting it hangs forever. Register synchronously at module top-level.
+2. **NEVER call `start()` before auth is ready.** Wait for your auth state listener to confirm the session, or race `getSession()` with a 5s timeout.
+3. **ALWAYS call `start()` again after `authExpired`** — refreshing the token in JS is not enough. The native layer holds the old token string. You must pass the new token via `start()`.
+4. **ALWAYS own the watcher in a module-level singleton** — not inside a React/Vue component. Effect cleanups will kill background tracking on navigation.
+5. **ALWAYS guard with `Capacitor.isNativePlatform()`** — this plugin has no web implementation.
 
 ### Quick Context
 
 - **What**: Native background location plugin for Capacitor 8 (iOS + Android)
 - **Why native**: WebView JS is suspended when backgrounded — this plugin POSTs from native code directly
 - **Peer dep**: `@capacitor/core` ^8.0.0
-- **No web implementation**: This plugin is native-only. It will not work in `npx cap serve` or browser-only mode.
+- **No web implementation**: Will not work in `npx cap serve` or browser-only mode
+- **iOS**: Tested and working
+- **Android**: Not yet tested — likely works but may have edge cases on Android 14+
 
 ### Step-by-Step Integration
 
@@ -179,39 +336,58 @@ MIT
    npm install capacitor-background-location
    npx cap sync
 
-2. iOS — add to Info.plist:
-   - NSLocationAlwaysAndWhenInUseUsageDescription
-   - NSLocationWhenInUseUsageDescription
-   - UIBackgroundModes: ["location"]
+2. Register plugin (MUST be synchronous, top-level):
+   import { registerPlugin } from '@capacitor/core';
+   export const BackgroundLocation = registerPlugin('BackgroundLocation');
 
-3. Android — add to AndroidManifest.xml:
-   - ACCESS_FINE_LOCATION
-   - ACCESS_COARSE_LOCATION
-   - FOREGROUND_SERVICE
-   - FOREGROUND_SERVICE_LOCATION
-   - ACCESS_BACKGROUND_LOCATION (Android 10+)
-
-4. Import and use:
+   OR use the package export:
    import { BackgroundLocation } from 'capacitor-background-location';
 
-5. Call start() with required options:
-   - sessionId: string (your unique tracking session ID)
-   - participantType: 'customer' | 'instructor'
-   - postUrl: string (your REST endpoint URL)
-   - apiKey: string (sent as 'apikey' header)
-   - authorization: string (sent as 'Authorization' header)
+3. iOS — add to Info.plist:
+   - NSLocationAlwaysAndWhenInUseUsageDescription (string)
+   - NSLocationWhenInUseUsageDescription (string)
+   - UIBackgroundModes: array containing "location"
 
-6. Listen for events:
-   - 'fix': location update received (includes didWrite boolean)
-   - 'authExpired': 401 received, refresh token and call start() again
+4. Android — add to AndroidManifest.xml:
+   <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+   <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+   <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+5. Create a singleton service file (NOT inside a component):
+   // src/services/location-service.ts
+   import { BackgroundLocation } from 'capacitor-background-location';
+   import { Capacitor } from '@capacitor/core';
+
+   export async function startTracking(opts) {
+     if (!Capacitor.isNativePlatform()) return;
+     await BackgroundLocation.start(opts);
+   }
+   export async function stopTracking() {
+     if (!Capacitor.isNativePlatform()) return;
+     await BackgroundLocation.stop();
+     await BackgroundLocation.removeAllListeners();
+   }
+
+6. Call start() ONLY after auth is confirmed ready:
+   - Wait for your auth state change listener to fire, OR
+   - Race getSession() with a 5-second timeout
+
+7. Listen for events:
+   - 'fix': location update (includes didWrite boolean)
+   - 'authExpired': 401 received — MUST call start() again with fresh token
    - 'permissionDenied': user denied location permission
 
-7. Call stop() to end tracking.
+8. Call stop() on logout/session end.
+
+9. Store consent in localStorage (not cookies) for GDPR.
+   Re-call start() on app resume if consent is still valid.
 ```
 
 ### Common Patterns
 
-**Starting tracking after login:**
+**Starting tracking after auth confirmed:**
 ```typescript
 import { BackgroundLocation } from 'capacitor-background-location';
 
@@ -220,7 +396,7 @@ async function startTracking(session: { id: string; role: 'customer' | 'instruct
     sessionId: session.id,
     participantType: session.role,
     postUrl: `${API_BASE}/rest/v1/live_locations`,
-    apiKey: SUPABASE_ANON_KEY,
+    apiKey: API_KEY,
     authorization: `Bearer ${token}`,
     throttleMs: 5000,
   });
@@ -249,20 +425,28 @@ async function endSession() {
 }
 ```
 
-### Important Notes for AI Assistants
+### Timeout Helper (recommended for all awaited calls)
+
+```typescript
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+```
+
+### Important Implementation Notes
 
 1. **Do not wrap in try/catch silently** — surface errors to the user, especially permission denials.
-2. **Always listen for `authExpired`** — without this handler, location POSTs will silently stop after token expiry.
-3. **Call `stop()` explicitly** — the service persists across app restarts on Android if not stopped.
-4. **`postUrl` must be a full URL** — not a relative path. Include protocol and host.
-5. **The plugin handles permissions internally** — do not request location permission separately. The plugin will prompt and emit `permissionDenied` if denied.
-6. **`throttleMs` controls POST frequency, not GPS frequency** — GPS fires every ~5s regardless. The throttle only gates network writes.
-7. **No web fallback** — guard usage with platform checks if your app also runs in browser:
-   ```typescript
-   import { Capacitor } from '@capacitor/core';
-   if (Capacitor.isNativePlatform()) {
-     await BackgroundLocation.start({ ... });
-   }
-   ```
-8. **The `Prefer: resolution=merge-duplicates` header** is sent on every POST. This is designed for PostgREST/Supabase upsert but is harmless on other backends.
-9. **POST payload uses snake_case** (`session_id`, `participant_type`, `updated_at`) regardless of the camelCase JS interface.
+2. **`postUrl` must be a full URL** — not a relative path. Include protocol and host.
+3. **The plugin handles permissions internally** — do not request location permission separately.
+4. **`throttleMs` controls POST frequency, not GPS frequency** — GPS fires every ~5s regardless.
+5. **POST payload uses snake_case** (`session_id`, `participant_type`, `updated_at`) regardless of the camelCase JS interface.
+6. **The `Prefer: resolution=merge-duplicates` header** is sent on every POST. Designed for PostgREST-compatible upsert APIs, harmless on other backends.
+7. **iOS `showsBackgroundLocationIndicator = true`** is set — required for App Store review with Always authorization.
+8. **Vendored plugins** (not installed via npm) need manual linking via `.podspec` (iOS) or `settings.gradle` (Android).
+9. **401 backoff**: After a 401, native POSTs are suppressed for 60s (iOS). Calling `start()` with a fresh token clears the backoff immediately.
+10. **Upsert constraint**: If your backend uses the `Prefer` header for upserts, ensure a unique constraint on `(session_id, participant_type)` exists in your table.
