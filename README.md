@@ -13,6 +13,13 @@ A Capacitor 8 plugin for **continuous background location tracking** with **nati
 - Permission handling with `permissionDenied` event
 - Real-time `fix` events forwarded to JS when the app is foregrounded
 
+## Status
+
+| Platform | Tested |
+|----------|--------|
+| iOS      | ✅ Yes  |
+| Android  | ❌ Not yet (as of 11/5/26) |
+
 ## Install
 
 ```bash
