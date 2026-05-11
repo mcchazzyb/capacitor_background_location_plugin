@@ -1,0 +1,39 @@
+{
+  "name": "capacitor-background-location",
+  "version": "1.0.0",
+  "description": "Capacitor plugin for continuous background location tracking with native HTTP POST. Works on iOS and Android without relying on WebView JS execution.",
+  "main": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "capacitor",
+    "plugin",
+    "background",
+    "location",
+    "gps",
+    "tracking",
+    "foreground-service",
+    "ios",
+    "android"
+  ],
+  "author": "",
+  "license": "MIT",
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    },
+    "android": {
+      "src": "android"
+    }
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^8.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/core": "^8.3.2",
+    "typescript": "~5.4.0"
+  }
+}
